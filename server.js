@@ -6,6 +6,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 // Safely import the older pdf-parse package
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
+// Force direct function evaluation of the module
 const pdfParse = require('pdf-parse');
 const app = express();
 app.use(cors());
@@ -44,12 +45,23 @@ app.post('/api/autofill', async (req, res) => {
       return res.status(404).json({ error: "Knowledge base missing. Please upload your company docs in the dashboard." });
     }
 
- // Convert Blob to Buffer and extract text
-    const arrayBuffer = await pdfBlob.arrayBuffer();
-    
-    // Safely unwrap the function to prevent the TypeError
-    const extractPdfText = typeof pdfParse === 'function' ? pdfParse : pdfParse.default;
-    const parsedPdf = await extractPdfText(Buffer.from(arrayBuffer));
+// Convert Blob to Buffer and extract text
+const arrayBuffer = await pdfBlob.arrayBuffer();
+const buffer = Buffer.from(arrayBuffer);
+
+// Handle both function or default export variations safely
+let parsedPdf;
+if (typeof pdfParse === 'function') {
+  parsedPdf = await pdfParse(buffer);
+} else if (pdfParse.default && typeof pdfParse.default === 'function') {
+  parsedPdf = await pdfParse.default(buffer);
+} else {
+  // Fallback for CommonJS interop in Node ESM
+  const parseFn = pdfParse.default || pdfParse;
+  parsedPdf = await parseFn(buffer);
+}
+
+const companyKnowledgeBase = parsedPdf.text;
     
     const companyKnowledgeBase = parsedPdf.text;
     // 4. Force Gemini to output Strict JSON Array matching our schema
