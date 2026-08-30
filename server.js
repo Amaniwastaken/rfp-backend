@@ -44,11 +44,14 @@ app.post('/api/autofill', async (req, res) => {
       return res.status(404).json({ error: "Knowledge base missing. Please upload your company docs in the dashboard." });
     }
 
-    // Convert Blob to Buffer and extract text
+ // Convert Blob to Buffer and extract text
     const arrayBuffer = await pdfBlob.arrayBuffer();
-    const parsedPdf = await pdfParse(Buffer.from(arrayBuffer));
+    
+    // Safely unwrap the function to prevent the TypeError
+    const extractPdfText = typeof pdfParse === 'function' ? pdfParse : pdfParse.default;
+    const parsedPdf = await extractPdfText(Buffer.from(arrayBuffer));
+    
     const companyKnowledgeBase = parsedPdf.text;
-
     // 4. Force Gemini to output Strict JSON Array matching our schema
     const responseSchema = {
       type: Type.ARRAY,
