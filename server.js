@@ -3,15 +3,8 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI, Type } from '@google/genai';
 
-// Safely import the older pdf-parse package (CommonJS module)
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const pdfParseModule = require('pdf-parse');
-// pdf-parse exports differently depending on the bundler/version —
-// resolve once at startup instead of re-checking on every request.
-const pdfParse = typeof pdfParseModule === 'function'
-  ? pdfParseModule
-  : (pdfParseModule.default || pdfParseModule);
+// pdf-parse v2+ uses a class-based API (no more bare function export)
+import { PDFParse } from 'pdf-parse';
 
 const app = express();
 app.use(cors());
@@ -54,7 +47,8 @@ app.post('/api/autofill', async (req, res) => {
     const arrayBuffer = await pdfBlob.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    const parsedPdf = await pdfParse(buffer);
+    const parser = new PDFParse({ data: buffer });
+    const parsedPdf = await parser.getText();
     const companyKnowledgeBase = parsedPdf.text;
 
     // 4. Force Gemini to output Strict JSON Array matching our schema
