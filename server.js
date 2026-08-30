@@ -3,11 +3,16 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI, Type } from '@google/genai';
 
-// Safely import the older pdf-parse package
+// Safely import the older pdf-parse package (CommonJS module)
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-// Force direct function evaluation of the module
-const pdfParse = require('pdf-parse');
+const pdfParseModule = require('pdf-parse');
+// pdf-parse exports differently depending on the bundler/version —
+// resolve once at startup instead of re-checking on every request.
+const pdfParse = typeof pdfParseModule === 'function'
+  ? pdfParseModule
+  : (pdfParseModule.default || pdfParseModule);
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -40,30 +45,18 @@ app.post('/api/autofill', async (req, res) => {
     const { data: pdfBlob, error: downloadError } = await supabase.storage
       .from('knowledge_base')
       .download(`${user.id}/docs.pdf`);
-      
+
     if (downloadError) {
       return res.status(404).json({ error: "Knowledge base missing. Please upload your company docs in the dashboard." });
     }
 
-// Convert Blob to Buffer and extract text
-const arrayBuffer = await pdfBlob.arrayBuffer();
-const buffer = Buffer.from(arrayBuffer);
+    // Convert Blob to Buffer and extract text
+    const arrayBuffer = await pdfBlob.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
 
-// Handle both function or default export variations safely
-let parsedPdf;
-if (typeof pdfParse === 'function') {
-  parsedPdf = await pdfParse(buffer);
-} else if (pdfParse.default && typeof pdfParse.default === 'function') {
-  parsedPdf = await pdfParse.default(buffer);
-} else {
-  // Fallback for CommonJS interop in Node ESM
-  const parseFn = pdfParse.default || pdfParse;
-  parsedPdf = await parseFn(buffer);
-}
-
-const companyKnowledgeBase = parsedPdf.text;
-    
+    const parsedPdf = await pdfParse(buffer);
     const companyKnowledgeBase = parsedPdf.text;
+
     // 4. Force Gemini to output Strict JSON Array matching our schema
     const responseSchema = {
       type: Type.ARRAY,
@@ -90,7 +83,7 @@ const companyKnowledgeBase = parsedPdf.text;
       If the answer is not in the knowledge base, output "Information not available in provided documentation."
     `;
 
-    // 5. Query Gemini 1.5 Flash (Fastest model for DOM injection)
+    // 5. Query Gemini (fastest model for DOM injection)
     const aiResponse = await ai.models.generateContent({
       model: 'gemini-1.5-flash',
       contents: prompt,
