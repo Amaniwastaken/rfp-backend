@@ -2,8 +2,11 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI, Type } from '@google/genai';
-import pdfParse from 'pdf-parse';
 
+// Safely import the older pdf-parse package
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pdfParse = require('pdf-parse');
 const app = express();
 app.use(cors());
 app.use(express.json());
