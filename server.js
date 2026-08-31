@@ -34,15 +34,35 @@ app.post('/api/autofill', async (req, res) => {
     }
 
     // 3. Fetch User's PDF from Supabase Storage & Parse it
-    // Assumption: The user's dashboard uploads their doc to the 'knowledge_base' bucket as `{user.id}/docs.pdf`
-    const { data: pdfBlob, error: downloadError } = await supabase.storage
+   // 3. Fetch ALL User PDFs from Supabase Storage & Parse them
+    const { data: fileList, error: listError } = await supabase.storage
       .from('knowledge_base')
-      .download(`${user.id}/docs.pdf`);
-
-    if (downloadError) {
-      return res.status(404).json({ error: "Knowledge base missing. Please upload your company docs in the dashboard." });
+      .list(`${user.id}/`);
+      
+    if (listError || !fileList || fileList.length === 0) {
+      return res.status(404).json({ error: "No documents found. Please upload company docs in the extension." });
     }
 
+    let companyKnowledgeBase = "";
+
+    // Loop through every file the user uploaded
+    for (const file of fileList) {
+      if (file.name === '.emptyFolderPlaceholder' || !file.name.endsWith('.pdf')) continue;
+
+      const { data: pdfBlob, error: downloadError } = await supabase.storage
+        .from('knowledge_base')
+        .download(`${user.id}/${file.name}`);
+        
+      if (!downloadError && pdfBlob) {
+        const arrayBuffer = await pdfBlob.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        
+        const extractPdfText = typeof pdfParse === 'function' ? pdfParse : pdfParse.default;
+        const parsedPdf = await extractPdfText(buffer);
+        
+        companyKnowledgeBase += `\n--- Document: ${file.name} ---\n${parsedPdf.text}\n`;
+      }
+    }
     // Convert Blob to Buffer and extract text
     const arrayBuffer = await pdfBlob.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
