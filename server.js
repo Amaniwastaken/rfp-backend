@@ -72,29 +72,35 @@ app.post('/api/autofill', async (req, res) => {
     const companyKnowledgeBase = parsedPdf.text;
 
     // 4. Force Gemini to output Strict JSON Array matching our schema
-    const responseSchema = {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          field_index: { type: Type.INTEGER, description: "The exact field_index provided in the prompt" },
-          answer: { type: Type.STRING, description: "The extracted answer for this form field" }
-        },
-        required: ["field_index", "answer"]
-      }
-    };
+// (Inside your /api/autofill route, right before the Gemini Prompt)
+    
+    // Fetch the user's custom saved answers
+    const { data: savedMemory } = await supabase
+      .from('custom_answers')
+      .select('question, answer')
+      .eq('user_id', user.id);
+      
+    let memoryContext = "PREVIOUSLY SAVED MANUAL ANSWERS:\n";
+    if (savedMemory && savedMemory.length > 0) {
+      savedMemory.forEach(item => {
+        memoryContext += `Question: ${item.question}\nAnswer: ${item.answer}\n\n`;
+      });
+    }
 
     const prompt = `
       You are an expert sales engineer filling out a B2B security questionnaire.
-      REFERENCE KNOWLEDGE BASE:
+      REFERENCE KNOWLEDGE BASE (PDFs):
       ${companyKnowledgeBase}
+
+      ${memoryContext}
 
       FORM QUESTIONS:
       ${JSON.stringify(fields)}
 
       INSTRUCTIONS: 
-      Read each form question. Find the answer in the reference knowledge base. Provide a concise, professional answer for each field. 
-      If the answer is not in the knowledge base, output "Information not available in provided documentation."
+      1. First, check the "PREVIOUSLY SAVED MANUAL ANSWERS". If the answer is there, use it exactly.
+      2. If not, find the answer in the "REFERENCE KNOWLEDGE BASE".
+      3. If the answer does not exist in EITHER, you MUST output exactly this string: "[NEEDS_INPUT]"
     `;
 
     // 5. Query Gemini (fastest model for DOM injection)
@@ -123,4 +129,32 @@ app.post('/api/autofill', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// NEW ROUTE: Save manual answers to the database
+app.post('/api/learn', async (req, res) => {
+  const { qnaPairs, token } = req.body;
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) return res.status(401).json({ error: "Invalid session" });
+
+    // Format data for Supabase upsert (updates existing questions, inserts new ones)
+    const upsertData = qnaPairs.map(pair => ({
+      user_id: user.id,
+      question: pair.question,
+      answer: pair.answer
+    }));
+
+    const { error } = await supabase
+      .from('custom_answers')
+      .upsert(upsertData, { onConflict: 'user_id, question' });
+
+    if (error) throw error;
+    return res.json({ status: "SUCCESS" });
+
+  } catch (err) {
+    console.error("Learn Error:", err);
+    return res.status(500).json({ error: "Failed to save memory." });
+  }
+});
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
