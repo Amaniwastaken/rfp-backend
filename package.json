@@ -13,7 +13,7 @@
     "cors": "latest",
     "express": "latest",
     "multer": "latest",
-    "pdf-parse": "latest"
+    "pdf-parse": "latest",
     "stripe": "^34.0.0"
   }
 }
