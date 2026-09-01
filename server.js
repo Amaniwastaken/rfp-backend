@@ -23,8 +23,13 @@ app.post('/api/autofill', async (req, res) => {
     if (authError || !user) return res.status(401).json({ error: "Invalid session. Please log in again." });
 
   // 2. Paywall & Usage Enforcement
-    const { data: profile } = await supabase.from('profiles').select('*').eq('id', user.id).single();
-    
+    const { data: profile, error: profileError } = await supabase.from('profiles').select('*').eq('id', user.id).single();
+
+    if (profileError || !profile) {
+      console.error("Profile lookup failed:", profileError);
+      return res.status(404).json({ error: "No account profile found. Please contact support." });
+    }
+
     if (profile.tier === 'Free' && profile.forms_filled >= 3) {
       return res.status(403).json({ error: "PAYWALL: Free trial limit reached (3 forms). Please upgrade to Starter!" });
     }
@@ -57,14 +62,19 @@ app.post('/api/autofill', async (req, res) => {
         .download(`${user.id}/${file.name}`);
         
       if (!downloadError && pdfBlob) {
-        const arrayBuffer = await pdfBlob.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
+        try {
+          const arrayBuffer = await pdfBlob.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
 
-        // Claude's bulletproof class-based PDF parser fix
-        const parser = new PDFParse({ data: buffer });
-        const parsedPdf = await parser.getText();
-        
-        companyKnowledgeBase += `\n--- Document: ${file.name} ---\n${parsedPdf.text}\n`;
+          const parser = new PDFParse({ data: buffer });
+          const parsedPdf = await parser.getText();
+
+          companyKnowledgeBase += `\n--- Document: ${file.name} ---\n${parsedPdf.text}\n`;
+        } catch (parseErr) {
+          // Don't let one corrupt/unreadable PDF kill the whole request —
+          // skip it and keep going with whatever else is in the knowledge base.
+          console.error(`Failed to parse ${file.name}:`, parseErr);
+        }
       }
     }
 
