@@ -22,14 +22,19 @@ app.post('/api/autofill', async (req, res) => {
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) return res.status(401).json({ error: "Invalid session. Please log in again." });
 
-    // 2. Paywall & Usage Enforcement
+  // 2. Paywall & Usage Enforcement
     const { data: profile } = await supabase.from('profiles').select('*').eq('id', user.id).single();
+    
     if (profile.tier === 'Free' && profile.forms_filled >= 3) {
-      return res.status(403).json({ error: "PAYWALL: Free trial limit reached. Upgrade to Pro!" });
+      return res.status(403).json({ error: "PAYWALL: Free trial limit reached (3 forms). Please upgrade to Starter!" });
     }
     if (profile.tier === 'Starter' && profile.forms_filled >= 15) {
-      return res.status(403).json({ error: "PAYWALL: Monthly limit reached. Upgrade to Growth!" });
+      return res.status(403).json({ error: "PAYWALL: Starter monthly limit reached (15 forms). Upgrade to Growth!" });
     }
+    if (profile.tier === 'Growth' && profile.forms_filled >= 30) {
+      return res.status(403).json({ error: "PAYWALL: Growth monthly limit reached (30 forms). Upgrade to Agency for unlimited forms!" });
+    }
+    // Agency tier has no limit check, so it flows right through!
 
     // ==========================================
     // 3. FETCH ALL USER PDFS (Multi-file Support)
