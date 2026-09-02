@@ -182,4 +182,31 @@ app.post('/api/learn', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// ==========================================
+// 10. SUPPORT / FEEDBACK ROUTE (SUPABASE)
+// ==========================================
+app.post('/api/support', async (req, res) => {
+  const { message, email, token } = req.body;
+  
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+  if (!message) return res.status(400).json({ error: "No message provided" });
+
+  try {
+    // Authenticate the user securely
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) return res.status(401).json({ error: "Invalid session" });
+
+    // Insert the ticket into Supabase
+    const { error } = await supabase
+      .from('support_inquiries')
+      .insert([{ user_id: user.id, email: email, message: message }]);
+
+    if (error) throw error;
+    
+    return res.json({ status: "SUCCESS" });
+  } catch (err) {
+    console.error("Support Error:", err);
+    return res.status(500).json({ error: "Failed to save message." });
+  }
+});
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
