@@ -22,7 +22,7 @@ app.post('/api/autofill', async (req, res) => {
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) return res.status(401).json({ error: "Invalid session. Please log in again." });
 
-  // 2. Paywall & Usage Enforcement
+    // 2. Paywall & Usage Enforcement
     const { data: profile, error: profileError } = await supabase.from('profiles').select('*').eq('id', user.id).single();
 
     if (profileError || !profile) {
@@ -39,7 +39,10 @@ app.post('/api/autofill', async (req, res) => {
     if (profile.tier === 'Growth' && profile.forms_filled >= 30) {
       return res.status(403).json({ error: "PAYWALL: Growth monthly limit reached (30 forms). Upgrade to Agency for unlimited forms!" });
     }
-    // Agency tier has no limit check, so it flows right through!
+    
+    // Determine feature flags based on tier
+    const allowToneRules = (profile.tier === 'Growth' || profile.tier === 'Agency');
+    const includeWatermark = (profile.tier === 'Free' || profile.tier === 'Starter');
 
     // ==========================================
     // 3. FETCH ALL USER PDFS (Multi-file Support)
@@ -71,8 +74,6 @@ app.post('/api/autofill', async (req, res) => {
 
           companyKnowledgeBase += `\n--- Document: ${file.name} ---\n${parsedPdf.text}\n`;
         } catch (parseErr) {
-          // Don't let one corrupt/unreadable PDF kill the whole request —
-          // skip it and keep going with whatever else is in the knowledge base.
           console.error(`Failed to parse ${file.name}:`, parseErr);
         }
       }
@@ -110,7 +111,7 @@ app.post('/api/autofill', async (req, res) => {
       }
     };
 
-    const prompt = `
+    let prompt = `
       You are an expert sales engineer filling out a B2B security questionnaire.
       REFERENCE KNOWLEDGE BASE:
       ${companyKnowledgeBase}
@@ -126,7 +127,12 @@ app.post('/api/autofill', async (req, res) => {
       3. If the answer does not exist in EITHER, you MUST output exactly: "[NEEDS_INPUT]"
     `;
 
-    // 6. Query Gemini 2.5 Flash
+    // Apply custom tone rules if the user is on a premium tier and has rules saved
+    if (allowToneRules && profile.tone_rules && profile.tone_rules.trim() !== "") {
+      prompt += `\n\nAPPLY THE FOLLOWING CUSTOM TONE & STYLE RULES TO ALL ANSWERS:\n${profile.tone_rules.trim()}`;
+    }
+
+    // 6. Query Gemini 3.5 Flash Lite
     const aiResponse = await ai.models.generateContent({
       model: 'gemini-3.5-flash-lite',
       contents: prompt,
@@ -142,8 +148,12 @@ app.post('/api/autofill', async (req, res) => {
     // 7. Increment forms_filled count
     await supabase.from('profiles').update({ forms_filled: profile.forms_filled + 1 }).eq('id', user.id);
 
-    // 8. Send answers back to the Chrome Extension
-    return res.json({ status: "SUCCESS", answers: structuredAnswers });
+    // 8. Send answers and watermark flag back to the Chrome Extension
+    return res.json({ 
+      status: "SUCCESS", 
+      answers: structuredAnswers,
+      includeWatermark: includeWatermark 
+    });
 
   } catch (err) {
     console.error("Backend Error:", err);
@@ -181,7 +191,6 @@ app.post('/api/learn', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
 // ==========================================
 // 10. SUPPORT / FEEDBACK ROUTE (SUPABASE)
 // ==========================================
@@ -192,11 +201,9 @@ app.post('/api/support', async (req, res) => {
   if (!message) return res.status(400).json({ error: "No message provided" });
 
   try {
-    // Authenticate the user securely
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) return res.status(401).json({ error: "Invalid session" });
 
-    // Insert the ticket into Supabase
     const { error } = await supabase
       .from('support_inquiries')
       .insert([{ user_id: user.id, email: email, message: message }]);
@@ -209,4 +216,6 @@ app.post('/api/support', async (req, res) => {
     return res.status(500).json({ error: "Failed to save message." });
   }
 });
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
