@@ -194,26 +194,46 @@ app.get('/reset-password', (req, res) => {
       <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #F6F7F5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; color: #1C2321; }
-        .card { background: white; padding: 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); width: 100%; max-width: 340px; text-align: center; border: 1px solid #DDE1DA; }
+        .card { background: white; padding: 40px 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); width: 100%; max-width: 340px; text-align: center; border: 1px solid #DDE1DA; }
         h1 { font-size: 20px; margin-top: 0; margin-bottom: 8px; color: #1C2321; }
-        p { font-size: 14px; color: #5C665F; margin-bottom: 24px; }
+        p { font-size: 14px; color: #5C665F; margin-bottom: 24px; line-height: 1.5; }
         input { width: 100%; padding: 12px; margin-bottom: 16px; border: 1px solid #DDE1DA; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
         input:focus { outline: none; border-color: #4B7862; box-shadow: 0 0 0 3px rgba(75,120,98,.13); }
         button { width: 100%; padding: 12px; background: #4B7862; color: white; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
         button:hover { background: #3D6350; }
         button:disabled { opacity: 0.6; cursor: not-allowed; }
-        #status { margin-top: 16px; font-size: 13px; font-weight: 500; }
+        #status { margin-top: 16px; font-size: 13px; font-weight: 500; color: #A8453D; }
+        
+        /* Success Screen Styles */
+        #success-screen { display: none; }
+        .check-icon { width: 56px; height: 56px; background: rgba(75,120,98,.13); color: #4B7862; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h1>Reset your password</h1>
-        <p>Enter your new password below.</p>
-        <form id="reset-form">
-          <input type="password" id="new-password" placeholder="New Password (min 6 chars)" required minlength="6">
-          <button type="submit" id="submit-btn">Update Password</button>
-        </form>
-        <div id="status"></div>
+        
+        <!-- INITIAL FORM -->
+        <div id="form-screen">
+          <h1>Reset your password</h1>
+          <p>Enter your new password below.</p>
+          <form id="reset-form">
+            <input type="password" id="new-password" placeholder="New Password (min 6 chars)" required minlength="6">
+            <button type="submit" id="submit-btn">Update Password</button>
+          </form>
+          <div id="status"></div>
+        </div>
+
+        <!-- SUCCESS CONFIRMATION -->
+        <div id="success-screen">
+          <div class="check-icon">
+            <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+          </div>
+          <h1>Password Updated!</h1>
+          <p>Your password has been successfully changed. You can now close this tab and log back into the Chrome Extension.</p>
+        </div>
+
       </div>
 
       <script>
@@ -230,19 +250,19 @@ app.get('/reset-password', (req, res) => {
 
           btn.disabled = true;
           btn.textContent = 'Updating...';
+          status.textContent = '';
 
-          // Supabase automatically detects the secure token in the URL hash
+          // Supabase detects the secure token in the URL automatically
           const { error } = await supabase.auth.updateUser({ password: newPassword });
 
           if (error) {
             status.textContent = "Error: " + error.message;
-            status.style.color = '#A8453D';
             btn.disabled = false;
             btn.textContent = 'Update Password';
           } else {
-            status.textContent = 'Success! You can now close this tab and log in to the Chrome Extension.';
-            status.style.color = '#4B7862';
-            document.getElementById('reset-form').style.display = 'none';
+            // Hide form and show success confirmation
+            document.getElementById('form-screen').style.display = 'none';
+            document.getElementById('success-screen').style.display = 'block';
           }
         });
       </script>
