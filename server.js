@@ -464,7 +464,7 @@ app.get('/reset-password', (req, res) => {
   <title>Reset Password - RFP Auto-Filler</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #F6F7F5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; color: #1C2321; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #F6F7F5; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; color: #1C2321; }
     .card { background: white; padding: 40px 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); width: 100%; max-width: 340px; text-align: center; border: 1px solid #DDE1DA; }
     h1 { font-size: 20px; margin-top: 0; margin-bottom: 8px; color: #1C2321; }
     p { font-size: 14px; color: #5C665F; margin-bottom: 24px; line-height: 1.5; }
@@ -473,7 +473,9 @@ app.get('/reset-password', (req, res) => {
     button { width: 100%; padding: 12px; background: #4B7862; color: white; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
     button:hover { background: #3D6350; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
-    #status { margin-top: 16px; font-size: 13px; font-weight: 500; color: #A8453D; }
+    #status { margin-top: 16px; font-size: 13px; font-weight: 500; min-height: 20px; }
+    .error { color: #A8453D; }
+    .ok { color: #4B7862; }
     #success-screen { display: none; }
     .check-icon { width: 56px; height: 56px; background: rgba(75,120,98,.13); color: #4B7862; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; }
   </style>
@@ -485,7 +487,7 @@ app.get('/reset-password', (req, res) => {
       <p>Enter your new password below.</p>
       <form id="reset-form">
         <input type="password" id="new-password" placeholder="New Password (min 6 chars)" required minlength="6">
-        <button type="submit" id="submit-btn">Update Password</button>
+        <button type="submit" id="submit-btn" disabled>Verifying link...</button>
       </form>
       <div id="status"></div>
     </div>
@@ -500,29 +502,62 @@ app.get('/reset-password', (req, res) => {
     </div>
   </div>
   <script>
-    const supabaseUrl = '${process.env.SUPABASE_URL || 'https://lushkpzfgsazrzkbsxbx.supabase.co'}';
-    const supabaseKey = '${process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1c2hrcHpmZ3NhenJ6a2JzeGJ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgwNTQ0ODAsImV4cCI6MjEwMzYzMDQ4MH0.Z2A91Jkr0d0M1_DhV49AmU7H6vsNNaJFJWdlqoXPl5c'}';
-    const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
-
-    document.getElementById('reset-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const btn = document.getElementById('submit-btn');
-      const status = document.getElementById('status');
-      const newPassword = document.getElementById('new-password').value;
-
-      btn.disabled = true;
-      btn.textContent = 'Updating...';
-      status.textContent = '';
-
-      const { error } = await supabase.auth.updateUser({ password: newPassword });
-
-      if (error) {
-        status.textContent = "Error: " + error.message;
+    const SUPABASE_URL = '${process.env.SUPABASE_URL || 'https://lushkpzfgsazrzkbsxbx.supabase.co'}';
+    const SUPABASE_KEY = '${process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1c2hrcHpmZ3NhenJ6a2JzeGJ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgwNTQ0ODAsImV4cCI6MjEwMzYzMDQ4MH0.Z2A91Jkr0d0M1_DhV49AmU7H6vsNNaJFJWdlqoXPl5c'}';
+    const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+      auth: { persistSession: false }
+    });
+    const status = document.getElementById('status');
+    const btn = document.getElementById('submit-btn');
+    function setStatus(text, kind) {
+      status.textContent = text;
+      status.className = kind || '';
+    }
+    async function bootstrap() {
+      const url = new URL(window.location.href);
+      const code = url.searchParams.get('code');
+      const error_description = url.searchParams.get('error_description');
+      console.log('[reset] URL params:', JSON.stringify(Object.fromEntries(url.searchParams)));
+      if (error_description) {
+        setStatus('Reset link error: ' + error_description, 'error');
+        return;
+      }
+      if (!code) {
+        setStatus('No reset token found. Please request a new password reset email.', 'error');
+        return;
+      }
+      try {
+        const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+        if (error) throw error;
+        console.log('[reset] session established for user:', data?.session?.user?.id);
         btn.disabled = false;
         btn.textContent = 'Update Password';
-      } else {
+      } catch (err) {
+        console.error('[reset] code exchange failed:', err);
+        setStatus('Could not verify reset link: ' + err.message, 'error');
+      }
+    }
+    bootstrap();
+    document.getElementById('reset-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const newPassword = document.getElementById('new-password').value;
+      if (newPassword.length < 6) {
+        setStatus('Password must be at least 6 characters.', 'error');
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = 'Updating...';
+      setStatus('');
+      try {
+        const { error } = await supabase.auth.updateUser({ password: newPassword });
+        if (error) throw error;
         document.getElementById('form-screen').style.display = 'none';
         document.getElementById('success-screen').style.display = 'block';
+      } catch (err) {
+        console.error('[reset] updateUser error:', err);
+        setStatus('Error updating password: ' + err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Update Password';
       }
     });
   </script>
