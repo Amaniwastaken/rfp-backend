@@ -3,110 +3,123 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI, Type } from '@google/genai';
 import { PDFParse } from 'pdf-parse';
+import Stripe from 'stripe';
+import rateLimit from 'express-rate-limit';
 
 const app = express();
 app.use(cors());
+
+// ==========================================
+// 1. STRIPE WEBHOOK (Must be raw buffer)
+// ==========================================
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.client_reference_id;
+    const customerId = session.customer;
+    
+    // Auto-map based on checkout amount (Update to match your Stripe prices)
+    let newTier = 'Starter';
+    if (session.amount_total === 4900) newTier = 'Growth';
+    if (session.amount_total === 9900) newTier = 'Agency';
+
+    if (userId) {
+      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+      await supabase.from('profiles').update({ tier: newTier, stripe_customer_id: customerId }).eq('id', userId);
+    }
+  }
+  res.json({ received: true });
+});
+
+// Use JSON for all other routes
 app.use(express.json());
 
-// Initialize external clients
+// ==========================================
+// 2. RATE LIMITING & INIT
+// ==========================================
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 40,
+  message: { error: "Too many requests. Please try again in 15 minutes." }
+});
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-app.post('/api/autofill', async (req, res) => {
+// ==========================================
+// 3. AUTOFILL ROUTE (With Refund & Limits)
+// ==========================================
+app.post('/api/autofill', apiLimiter, async (req, res) => {
   const { fields, token } = req.body;
-
-  if (!token) return res.status(401).json({ error: "Unauthorized: Please log into the extension." });
+  if (!token) return res.status(401).json({ error: "Unauthorized." });
 
   try {
-    // 1. Authenticate the user via Supabase
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !user) return res.status(401).json({ error: "Invalid session. Please log in again." });
+    const { data: { user } } = await supabase.auth.getUser(token);
+    if (!user) return res.status(401).json({ error: "Invalid session." });
 
-    // 2. Paywall & Usage Enforcement
-    const { data: profile, error: profileError } = await supabase.from('profiles').select('*').eq('id', user.id).single();
+    const { data: profile } = await supabase.from('profiles').select('*').eq('id', user.id).single();
+    if (!profile) return res.status(404).json({ error: "Account not found." });
 
-    if (profileError || !profile) {
-      console.error("Profile lookup failed:", profileError);
-      return res.status(404).json({ error: "No account profile found. Please contact support." });
-    }
+    const tierLimits = { Free: 3, Starter: 15, Growth: 30, Agency: -1 };
+    const userLimit = tierLimits[profile.tier] !== undefined ? tierLimits[profile.tier] : 3;
 
-    if (profile.tier === 'Free' && profile.forms_filled >= 3) {
-      return res.status(403).json({ error: "PAYWALL: Free trial limit reached (3 forms). Please upgrade to Starter!" });
-    }
-    if (profile.tier === 'Starter' && profile.forms_filled >= 15) {
-      return res.status(403).json({ error: "PAYWALL: Starter monthly limit reached (15 forms). Upgrade to Growth!" });
-    }
-    if (profile.tier === 'Growth' && profile.forms_filled >= 30) {
-      return res.status(403).json({ error: "PAYWALL: Growth monthly limit reached (30 forms). Upgrade to Agency for unlimited forms!" });
-    }
+    // 1. Atomic Check & Increment
+    const { data: hasQuota } = await supabase.rpc('process_form_usage', { target_user_id: user.id, max_limit: userLimit });
+    if (!hasQuota) return res.status(403).json({ error: `PAYWALL: You have reached your ${profile.tier} tier limit.` });
     
-    // Determine feature flags based on tier
     const allowToneRules = (profile.tier === 'Growth' || profile.tier === 'Agency');
     const includeWatermark = (profile.tier === 'Free' || profile.tier === 'Starter');
 
-    // ==========================================
-    // 3. FETCH ALL USER PDFS (Multi-file Support)
-    // ==========================================
-    const { data: fileList, error: listError } = await supabase.storage
-      .from('knowledge_base')
-      .list(`${user.id}/`);
-      
-    if (listError || !fileList || fileList.length === 0) {
-      return res.status(404).json({ error: "Knowledge base missing. Please upload your company docs in the dashboard." });
+    // 2. Fetch PDFs (Capped at 3 to save memory/costs)
+    const { data: fileList } = await supabase.storage.from('knowledge_base').list(`${user.id}/`);
+    if (!fileList || fileList.length === 0) {
+      await supabase.rpc('refund_form_usage', { target_user_id: user.id });
+      return res.status(404).json({ error: "No company docs found." });
     }
 
     let companyKnowledgeBase = "";
+    let parsedCount = 0;
 
     for (const file of fileList) {
-      if (file.name === '.emptyFolderPlaceholder' || !file.name.endsWith('.pdf')) continue;
+      if (parsedCount >= 3) break;
+      if (!file.name.endsWith('.pdf')) continue;
 
-      const { data: pdfBlob, error: downloadError } = await supabase.storage
-        .from('knowledge_base')
-        .download(`${user.id}/${file.name}`);
-        
-      if (!downloadError && pdfBlob) {
+      const { data: pdfBlob } = await supabase.storage.from('knowledge_base').download(`${user.id}/${file.name}`);
+      if (pdfBlob) {
         try {
-          const arrayBuffer = await pdfBlob.arrayBuffer();
-          const buffer = Buffer.from(arrayBuffer);
-
-          const parser = new PDFParse({ data: buffer });
-          const parsedPdf = await parser.getText();
-
+          const buffer = Buffer.from(await pdfBlob.arrayBuffer());
+          const parsedPdf = await PDFParse({ data: buffer });
           companyKnowledgeBase += `\n--- Document: ${file.name} ---\n${parsedPdf.text}\n`;
-        } catch (parseErr) {
-          console.error(`Failed to parse ${file.name}:`, parseErr);
-        }
+          parsedCount++;
+        } catch (e) { console.error("PDF Parse error", e); }
       }
     }
 
     if (!companyKnowledgeBase.trim()) {
-      return res.status(404).json({ error: "No readable text found in uploaded PDFs." });
+      await supabase.rpc('refund_form_usage', { target_user_id: user.id });
+      return res.status(404).json({ error: "No readable text found in PDFs." });
     }
 
-    // ==========================================
-    // 4. FETCH MEMORY BANK (Custom Typed Answers)
-    // ==========================================
-    const { data: savedMemory } = await supabase
-      .from('custom_answers')
-      .select('question, answer')
-      .eq('user_id', user.id);
-      
+    // 3. Fetch Memory Bank
+    const { data: savedMemory } = await supabase.from('custom_answers').select('question, answer').eq('user_id', user.id);
     let memoryContext = "PREVIOUSLY SAVED MANUAL ANSWERS:\n";
-    if (savedMemory && savedMemory.length > 0) {
-      savedMemory.forEach(item => {
-        memoryContext += `Question: ${item.question}\nAnswer: ${item.answer}\n\n`;
-      });
-    }
+    if (savedMemory) savedMemory.forEach(item => { memoryContext += `Question: ${item.question}\nAnswer: ${item.answer}\n\n`; });
 
-    // 5. Force Gemini to output Strict JSON Array matching our schema
     const responseSchema = {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
-        properties: {
-          field_index: { type: Type.INTEGER, description: "The exact field_index provided in the prompt" },
-          answer: { type: Type.STRING, description: "The extracted answer for this form field" }
-        },
+        properties: { field_index: { type: Type.INTEGER }, answer: { type: Type.STRING } },
         required: ["field_index", "answer"]
       }
     };
@@ -115,106 +128,63 @@ app.post('/api/autofill', async (req, res) => {
       You are an expert sales engineer filling out a B2B security questionnaire.
       REFERENCE KNOWLEDGE BASE:
       ${companyKnowledgeBase}
-
       ${memoryContext}
-
       FORM QUESTIONS:
       ${JSON.stringify(fields)}
-
       INSTRUCTIONS: 
-      1. Check "PREVIOUSLY SAVED MANUAL ANSWERS". If the answer is there, use it exactly.
+      1. Check "PREVIOUSLY SAVED MANUAL ANSWERS" first.
       2. If not, find the answer in the "REFERENCE KNOWLEDGE BASE".
-      3. If the answer does not exist in EITHER, you MUST output exactly: "[NEEDS_INPUT]"
+      3. If neither contains the answer, output exactly: "[NEEDS_INPUT]"
     `;
 
-    // Apply custom tone rules if the user is on a premium tier and has rules saved
-    if (allowToneRules && profile.tone_rules && profile.tone_rules.trim() !== "") {
-      prompt += `\n\nAPPLY THE FOLLOWING CUSTOM TONE & STYLE RULES TO ALL ANSWERS:\n${profile.tone_rules.trim()}`;
+    if (allowToneRules && profile.tone_rules) {
+      prompt += `\n\nAPPLY THESE CUSTOM TONE RULES TO ALL ANSWERS:\n${profile.tone_rules.trim()}`;
     }
 
-    // 6. Query Gemini 3.5 Flash Lite
     const aiResponse = await ai.models.generateContent({
       model: 'gemini-3.5-flash-lite',
       contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: responseSchema,
-        temperature: 0.1 
-      }
+      config: { responseMimeType: 'application/json', responseSchema, temperature: 0.1 }
     });
 
     const structuredAnswers = JSON.parse(aiResponse.text);
 
-    // 7. Increment forms_filled count
-    await supabase.from('profiles').update({ forms_filled: profile.forms_filled + 1 }).eq('id', user.id);
+    // 4. Refund if AI failed completely or had NO answers
+    const hasRealAnswers = structuredAnswers.some(ans => ans.answer !== "[NEEDS_INPUT]");
+    if (!structuredAnswers || structuredAnswers.length === 0 || !hasRealAnswers) {
+      await supabase.rpc('refund_form_usage', { target_user_id: user.id });
+    }
 
-    // 8. Send answers and watermark flag back to the Chrome Extension
-    return res.json({ 
-      status: "SUCCESS", 
-      answers: structuredAnswers,
-      includeWatermark: includeWatermark 
-    });
+    return res.json({ status: "SUCCESS", answers: structuredAnswers, includeWatermark });
 
   } catch (err) {
-    console.error("Backend Error:", err);
-    return res.status(500).json({ error: "Failed to generate AI answers. Try again." });
+    if (req.body.token) {
+       const { data: { user } } = await supabase.auth.getUser(req.body.token);
+       if (user) await supabase.rpc('refund_form_usage', { target_user_id: user.id });
+    }
+    console.error(err);
+    return res.status(500).json({ error: "Failed to generate AI answers." });
   }
 });
 
-// ==========================================
-// 9. LEARN ROUTE (Saves manual answers to DB)
-// ==========================================
-app.post('/api/learn', async (req, res) => {
+// Learn and Support Routes
+app.post('/api/learn', apiLimiter, async (req, res) => {
   const { qnaPairs, token } = req.body;
-  if (!token) return res.status(401).json({ error: "Unauthorized" });
+  const { data: { user } } = await supabase.auth.getUser(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  try {
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !user) return res.status(401).json({ error: "Invalid session" });
-
-    const upsertData = qnaPairs.map(pair => ({
-      user_id: user.id,
-      question: pair.question,
-      answer: pair.answer
-    }));
-
-    const { error } = await supabase
-      .from('custom_answers')
-      .upsert(upsertData, { onConflict: 'user_id, question' });
-
-    if (error) throw error;
-    return res.json({ status: "SUCCESS" });
-
-  } catch (err) {
-    console.error("Learn Error:", err);
-    return res.status(500).json({ error: "Failed to save memory." });
-  }
+  const upsertData = qnaPairs.map(p => ({ user_id: user.id, question: p.question, answer: p.answer }));
+  await supabase.from('custom_answers').upsert(upsertData, { onConflict: 'user_id, question' });
+  return res.json({ status: "SUCCESS" });
 });
 
-// ==========================================
-// 10. SUPPORT / FEEDBACK ROUTE (SUPABASE)
-// ==========================================
-app.post('/api/support', async (req, res) => {
+app.post('/api/support', apiLimiter, async (req, res) => {
   const { message, email, token } = req.body;
-  
-  if (!token) return res.status(401).json({ error: "Unauthorized" });
-  if (!message) return res.status(400).json({ error: "No message provided" });
+  const { data: { user } } = await supabase.auth.getUser(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  try {
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !user) return res.status(401).json({ error: "Invalid session" });
-
-    const { error } = await supabase
-      .from('support_inquiries')
-      .insert([{ user_id: user.id, email: email, message: message }]);
-
-    if (error) throw error;
-    
-    return res.json({ status: "SUCCESS" });
-  } catch (err) {
-    console.error("Support Error:", err);
-    return res.status(500).json({ error: "Failed to save message." });
-  }
+  await supabase.from('support_inquiries').insert([{ user_id: user.id, email, message }]);
+  return res.json({ status: "SUCCESS" });
 });
 
 const PORT = process.env.PORT || 3000;
