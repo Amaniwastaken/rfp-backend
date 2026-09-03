@@ -14,7 +14,7 @@
     "express": "latest",
     "multer": "latest",
     "pdf-parse": "latest",
-    "stripe": "^14.25.0"
+    "stripe": "^14.25.0",
     "helmet": "latest"
   }
 }
