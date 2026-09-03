@@ -21,17 +21,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://rfp-auto-filler
   .map(s => s.trim())
   .filter(Boolean);
 
-app.use(cors({
-  origin: (origin, cb) => {
-    // Same-origin / curl / server-to-server: allow
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error('CORS: origin not allowed'));
-  },
-  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  credentials: true
-}));
-
+app.use(cors());
 // Lightweight security headers (no extra dep). Helmet would do more, but
 // for a JSON API + one inline-script HTML page, these are enough.
 app.use((_req, res, next) => {
