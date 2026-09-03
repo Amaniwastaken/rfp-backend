@@ -495,13 +495,22 @@ app.get('/reset-password', (req, res) => {
     const SUPABASE_URL = '${process.env.SUPABASE_URL || 'https://lushkpzfgsazrzkbsxbx.supabase.co'}';
     const SUPABASE_KEY = '${process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1c2hrcHpmZ3NhenJ6a2JzeGJ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgwNTQ0ODAsImV4cCI6MjEwMzYzMDQ4MH0.Z2A91Jkr0d0M1_DhV49AmU7H6vsNNaJFJWdlqoXPl5c'}';
     const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
-      auth: { persistSession: false }
+      auth: {
+        persistSession: false,
+        detectSessionInUrl: false
+      }
     });
     const status = document.getElementById('status');
     const btn = document.getElementById('submit-btn');
     function setStatus(text, kind) {
       status.textContent = text;
       status.className = kind || '';
+    }
+    function withTimeout(promise, ms, label) {
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms))
+      ]);
     }
     async function bootstrap() {
       const url = new URL(window.location.href);
@@ -517,7 +526,11 @@ app.get('/reset-password', (req, res) => {
         return;
       }
       try {
-        const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+        const { data, error } = await withTimeout(
+          supabase.auth.exchangeCodeForSession(code),
+          10000,
+          'Code exchange'
+        );
         if (error) throw error;
         console.log('[reset] session established for user:', data?.session?.user?.id);
         btn.disabled = false;
@@ -539,7 +552,11 @@ app.get('/reset-password', (req, res) => {
       btn.textContent = 'Updating...';
       setStatus('');
       try {
-        const { error } = await supabase.auth.updateUser({ password: newPassword });
+        const { error } = await withTimeout(
+          supabase.auth.updateUser({ password: newPassword }),
+          10000,
+          'Password update'
+        );
         if (error) throw error;
         document.getElementById('form-screen').style.display = 'none';
         document.getElementById('success-screen').style.display = 'block';
