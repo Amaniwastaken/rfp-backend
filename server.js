@@ -4,7 +4,6 @@ import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI, Type } from '@google/genai';
 import { PDFParse } from 'pdf-parse';
 import Stripe from 'stripe';
-import rateLimit from 'express-rate-limit';
 
 const app = express();
 app.use(cors());
@@ -45,21 +44,14 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
 // Use JSON for all other routes
 app.use(express.json());
 
-// ==========================================
-// 2. RATE LIMITING & INIT
-// ==========================================
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 40,
-  message: { error: "Too many requests. Please try again in 15 minutes." }
-});
-
+// Initialize Clients
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // ==========================================
-// 3. AUTOFILL ROUTE (With Refund & Limits)
+// 2. AUTOFILL ROUTE (With Refund & Limits)
 // ==========================================
-app.post('/api/autofill', apiLimiter, async (req, res) => {
+app.post('/api/autofill', async (req, res) => {
   const { fields, token } = req.body;
   if (!token) return res.status(401).json({ error: "Unauthorized." });
 
@@ -168,7 +160,7 @@ app.post('/api/autofill', apiLimiter, async (req, res) => {
 });
 
 // Learn and Support Routes
-app.post('/api/learn', apiLimiter, async (req, res) => {
+app.post('/api/learn', async (req, res) => {
   const { qnaPairs, token } = req.body;
   const { data: { user } } = await supabase.auth.getUser(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
@@ -178,7 +170,7 @@ app.post('/api/learn', apiLimiter, async (req, res) => {
   return res.json({ status: "SUCCESS" });
 });
 
-app.post('/api/support', apiLimiter, async (req, res) => {
+app.post('/api/support', async (req, res) => {
   const { message, email, token } = req.body;
   const { data: { user } } = await supabase.auth.getUser(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
