@@ -7,7 +7,6 @@ import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI, Type } from '@google/genai';
 import { PDFParse } from 'pdf-parse';
 import Stripe from 'stripe';
-import helmet from 'helmet';
 
 const app = express();
 
@@ -33,10 +32,15 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(helmet({
-  contentSecurityPolicy: false, // we serve a small HTML reset page that needs inline scripts
-  crossOriginEmbedderPolicy: false
-}));
+// Lightweight security headers (no extra dep). Helmet would do more, but
+// for a JSON API + one inline-script HTML page, these are enough.
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
 
 // ---------------------------------------------------------------------------
 // Stripe webhook MUST be mounted before express.json so we keep the raw body
