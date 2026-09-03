@@ -12,6 +12,7 @@
     "@supabase/supabase-js": "latest",
     "cors": "latest",
     "express": "latest",
+    "express-rate-limit": "latest",
     "multer": "latest",
     "pdf-parse": "latest",
     "stripe": "^14.25.0"
