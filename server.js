@@ -13,7 +13,9 @@ const app = express();
 // ---------------------------------------------------------------------------
 // CORS & Security Headers
 // ---------------------------------------------------------------------------
-app.use(cors()); // Left open intentionally for Chrome Extension traffic
+// CORS is left fully open to allow the Chrome Extension to communicate without origin blocks
+app.use(cors()); 
+
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -23,7 +25,7 @@ app.use((_req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Stripe Webhook (Raw Body required)
+// Stripe Webhook (Raw Body required for signature verification)
 // ---------------------------------------------------------------------------
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -36,6 +38,7 @@ const PRICE_ID_TO_TIER = {
 app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
+
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
@@ -45,10 +48,15 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
 
   const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-  // 1. Stripe Idempotency Check
-  const { data: existingEvent } = await supabase.from('stripe_events').select('id').eq('id', event.id).single();
+  // [FIX] 1. Stripe Idempotency Check: Prevent duplicate webhook processing
+  const { data: existingEvent } = await supabase
+    .from('stripe_events')
+    .select('id')
+    .eq('id', event.id)
+    .single();
+
   if (existingEvent) {
-    return res.json({ received: true, skipped: true }); // Already processed
+    return res.json({ received: true, skipped: true }); // Already processed this event
   }
 
   try {
@@ -56,27 +64,40 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
       case 'checkout.session.completed': {
         const session = event.data.object;
         if (session.payment_status !== 'paid') break;
+        
         const userId = session.client_reference_id;
         const customerId = session.customer;
+        
         if (!userId) break;
 
         let newTier = null;
         try {
           const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
           const priceId = lineItems.data[0]?.price?.id;
-          if (priceId && PRICE_ID_TO_TIER[priceId]) newTier = PRICE_ID_TO_TIER[priceId];
-        } catch (_) { /* fall through */ }
+          if (priceId && PRICE_ID_TO_TIER[priceId]) {
+            newTier = PRICE_ID_TO_TIER[priceId];
+          }
+        } catch (_) { 
+          /* Ignore error and fall back to amount check */ 
+        }
         
         if (!newTier) {
           if (session.amount_total === 1900) newTier = 'Starter';
           else if (session.amount_total === 4900) newTier = 'Growth';
           else if (session.amount_total === 9900) newTier = 'Agency';
         }
+        
         if (!newTier) newTier = 'Starter';
 
-        const { data: profile } = await supabase.from('profiles').select('tier').eq('id', userId).single();
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('tier')
+          .eq('id', userId)
+          .single();
+
         const tierRank = { Free: 0, Starter: 1, Growth: 2, Agency: 3 };
         
+        // Only upgrade if the new tier is higher or equal to the current tier
         if (!profile || (tierRank[newTier] ?? 0) >= (tierRank[profile.tier] ?? 0)) {
           await supabase.from('profiles').update({ tier: newTier, stripe_customer_id: customerId }).eq('id', userId);
         } else {
@@ -110,7 +131,7 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
       }
     }
 
-    // 2. Log event in idempotency table
+    // [FIX] 2. Log event in idempotency table so it never runs twice
     await supabase.from('stripe_events').insert([{ id: event.id, type: event.type }]);
 
   } catch (err) {
@@ -120,6 +141,7 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
   res.json({ received: true });
 });
 
+// Middleware for standard JSON parsing on non-webhook routes
 app.use(express.json({ limit: '1mb' }));
 
 // ---------------------------------------------------------------------------
@@ -138,18 +160,27 @@ const RATE_LIMITS = {
 function rateLimit(category, key) {
   const cfg = RATE_LIMITS[category];
   if (!cfg) return true;
+  
   const bucketKey = `${category}:${key}`;
   const now = Date.now();
   const entry = RATE_BUCKETS.get(bucketKey) || { count: 0, resetAt: now + cfg.windowMs };
-  if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + cfg.windowMs; }
+  
+  if (now > entry.resetAt) { 
+    entry.count = 0; 
+    entry.resetAt = now + cfg.windowMs; 
+  }
+  
   entry.count++;
   RATE_BUCKETS.set(bucketKey, entry);
   return entry.count <= cfg.max;
 }
 
+// Memory cleanup for rate limiter
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of RATE_BUCKETS) if (v.resetAt < now) RATE_BUCKETS.delete(k);
+  for (const [k, v] of RATE_BUCKETS) {
+    if (v.resetAt < now) RATE_BUCKETS.delete(k);
+  }
 }, 5 * 60_000).unref?.();
 
 async function getUserFromToken(token) {
@@ -159,11 +190,15 @@ async function getUserFromToken(token) {
   return data.user;
 }
 
-// Security sanitizer (used for BOTH PDFs and Form Field Labels now)
+// [FIX] Security sanitizer (used for BOTH PDFs and Form Field Labels to stop prompt injections)
 function sanitizePdfText(raw) {
   if (!raw) return '';
   let text = String(raw);
+  
+  // Remove control characters
   text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]+/g, ' ');
+  
+  // Look for common prompt injection patterns
   const patterns = [
     /ignore (?:all )?previous instructions/gi,
     /disregard (?:the )?system prompt/gi,
@@ -171,8 +206,14 @@ function sanitizePdfText(raw) {
     /<\|im_start\|>system/gi,
     /\bnew instructions:\b/gi
   ];
-  for (const re of patterns) text = text.replace(re, '[REDACTED]');
-  if (text.length > 40_000) text = text.slice(0, 40_000) + '\n[... truncated ...]';
+  
+  for (const re of patterns) {
+    text = text.replace(re, '[REDACTED]');
+  }
+  
+  if (text.length > 40_000) {
+    text = text.slice(0, 40_000) + '\n[... truncated ...]';
+  }
   return text;
 }
 
@@ -181,7 +222,9 @@ function sanitizePdfText(raw) {
 // ---------------------------------------------------------------------------
 app.post('/api/autofill', async (req, res) => {
   const { fields, token } = req.body || {};
+  
   if (!token) return res.status(401).json({ error: "Unauthorized." });
+  
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Invalid or expired session." });
 
@@ -196,16 +239,22 @@ app.post('/api/autofill', async (req, res) => {
     const tierLimits = { Free: 3, Starter: 15, Growth: 30, Agency: -1 };
     const userLimit = tierLimits[profile.tier] !== undefined ? tierLimits[profile.tier] : 3;
 
+    // Check usage limits
     const { data: hasQuota } = await supabase.rpc('process_form_usage', {
       target_user_id: user.id,
       max_limit: userLimit
     });
-    if (!hasQuota) return res.status(403).json({ error: `PAYWALL: You have reached your ${profile.tier} tier limit.` });
+    
+    if (!hasQuota) {
+      return res.status(403).json({ error: `PAYWALL: You have reached your ${profile.tier} tier limit.` });
+    }
 
     const allowToneRules = (profile.tier === 'Growth' || profile.tier === 'Agency');
     const includeWatermark = (profile.tier === 'Free' || profile.tier === 'Starter');
 
+    // Fetch user knowledge base documents
     const { data: fileList } = await supabase.storage.from('knowledge_base').list(`${user.id}/`);
+    
     if (!fileList || fileList.length === 0) {
       await supabase.rpc('refund_form_usage', { target_user_id: user.id });
       return res.status(404).json({ error: "No company docs found. Upload PDFs in the extension first." });
@@ -218,17 +267,22 @@ app.post('/api/autofill', async (req, res) => {
     for (const file of fileList) {
       if (parsedCount >= MAX_PDFS) break;
       if (!file.name || !file.name.toLowerCase().endsWith('.pdf')) continue;
+      
       try {
         const { data: pdfBlob } = await supabase.storage.from('knowledge_base').download(`${user.id}/${file.name}`);
         if (!pdfBlob) continue;
+        
         const buffer = Buffer.from(await pdfBlob.arrayBuffer());
         const parsedPdf = await PDFParse({ data: buffer });
+        
         const clean = sanitizePdfText(parsedPdf.text);
         if (clean.trim()) {
           companyKnowledgeBase += `\n--- Document: ${file.name} ---\n${clean}\n`;
           parsedCount++;
         }
-      } catch (e) { console.error(`[pdf] parse failed for ${file.name}:`, e.message); }
+      } catch (e) { 
+        console.error(`[pdf] parse failed for ${file.name}:`, e.message); 
+      }
     }
 
     if (!companyKnowledgeBase.trim()) {
@@ -236,6 +290,7 @@ app.post('/api/autofill', async (req, res) => {
       return res.status(404).json({ error: "No readable text found in your PDFs." });
     }
 
+    // Fetch Manual Q&A memory
     const { data: savedMemory } = await supabase.from('custom_answers').select('question, answer').eq('user_id', user.id);
     let memoryContext = "PREVIOUSLY SAVED MANUAL ANSWERS:\n";
     if (savedMemory && savedMemory.length) {
@@ -246,12 +301,13 @@ app.post('/api/autofill', async (req, res) => {
       memoryContext += "(none)\n";
     }
 
-    // SANITIZE EXTERNAL FORM FIELDS
+    // [FIX] Sanitize EXTERNAL form fields sent from the frontend to prevent prompt injection
     const sanitizedFields = Array.isArray(fields) ? fields.map(f => ({
       field_index: f.field_index,
       label: sanitizePdfText(f.label || 'Unknown Field')
     })) : [];
 
+    // Define strict JSON schema for Gemini
     const responseSchema = {
       type: Type.ARRAY,
       items: {
@@ -313,6 +369,7 @@ INSTRUCTIONS:
       return res.status(502).json({ error: "AI returned a malformed response." });
     }
 
+    // Refund if the AI couldn't figure out any answers
     const hasRealAnswers = Array.isArray(structuredAnswers) && structuredAnswers.some(a => a.answer && a.answer !== "[NEEDS_INPUT]");
     if (!hasRealAnswers) {
       await supabase.rpc('refund_form_usage', { target_user_id: user.id });
@@ -330,12 +387,21 @@ INSTRUCTIONS:
   }
 });
 
+// ---------------------------------------------------------------------------
+// Other Utility Routes (Learn, Support, Analytics)
+// ---------------------------------------------------------------------------
 app.post('/api/learn', async (req, res) => {
   const { qnaPairs, token } = req.body || {};
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  if (!Array.isArray(qnaPairs) || qnaPairs.length === 0) return res.status(400).json({ error: "No Q/A pairs provided." });
-  if (!rateLimit('learn', user.id)) return res.status(429).json({ error: "Rate limit exceeded." });
+  
+  if (!Array.isArray(qnaPairs) || qnaPairs.length === 0) {
+    return res.status(400).json({ error: "No Q/A pairs provided." });
+  }
+  
+  if (!rateLimit('learn', user.id)) {
+    return res.status(429).json({ error: "Rate limit exceeded." });
+  }
 
   const cleaned = qnaPairs
     .filter(p => p && typeof p.question === 'string' && typeof p.answer === 'string')
@@ -351,6 +417,7 @@ app.post('/api/learn', async (req, res) => {
 
   const { error } = await supabase.from('custom_answers').upsert(cleaned, { onConflict: 'user_id,question' });
   if (error) return res.status(500).json({ error: "Failed to save answers." });
+  
   return res.json({ status: "SUCCESS", saved: cleaned.length });
 });
 
@@ -358,7 +425,11 @@ app.post('/api/support', async (req, res) => {
   const { message, email, token } = req.body || {};
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  if (!message || typeof message !== 'string' || !message.trim()) return res.status(400).json({ error: "Message required." });
+  
+  if (!message || typeof message !== 'string' || !message.trim()) {
+    return res.status(400).json({ error: "Message required." });
+  }
+  
   if (!rateLimit('support', user.id)) return res.status(429).json({ error: "Rate limit exceeded." });
 
   const { error } = await supabase.from('support_inquiries').insert([{
@@ -374,6 +445,9 @@ app.post('/api/support', async (req, res) => {
 app.post('/api/analytics/install', (req, res) => res.json({ status: "OK" }));
 app.post('/api/analytics/update', (req, res) => res.json({ status: "OK" }));
 
+// ---------------------------------------------------------------------------
+// Password Reset HTML Viewer
+// ---------------------------------------------------------------------------
 app.get('/reset-password', (req, res) => {
   res.set('Content-Type', 'text/html; charset=utf-8');
   res.send(`
@@ -490,16 +564,20 @@ app.get('/reset-password', (req, res) => {
     document.getElementById('reset-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const newPassword = document.getElementById('new-password').value;
+      
       if (newPassword.length < 6) {
         setStatus('Password must be at least 6 characters.', 'error');
         return;
       }
+      
       btn.disabled = true;
       btn.textContent = 'Updating...';
       setStatus('');
+      
       try {
         const { error } = await withTimeout(supabaseClient.auth.updateUser({ password: newPassword }), 10000, 'Password update');
         if (error) throw error;
+        
         document.getElementById('form-screen').style.display = 'none';
         document.getElementById('success-screen').style.display = 'block';
       } catch (err) {
