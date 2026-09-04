@@ -72,8 +72,6 @@ app.post('/api/webhook/stripe',
           const customerId = session.customer;
           if (!userId) break;
 
-          // Prefer price.id mapping (robust to coupons / tax / price changes).
-          // Fall back to line items, then to amount for legacy links.
           let newTier = null;
           try {
             const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
@@ -87,21 +85,16 @@ app.post('/api/webhook/stripe',
           }
           if (!newTier) newTier = 'Starter';
 
-          // Idempotency: only downgrade-free upgrades, never overwrite a
-          // higher tier with a lower one (e.g. a stale webhook firing for
-          // a user who's already on Agency).
           const { data: profile } = await supabase.from('profiles').select('tier').eq('id', userId).single();
           const tierRank = { Free: 0, Starter: 1, Growth: 2, Agency: 3 };
           if (!profile || (tierRank[newTier] ?? 0) >= (tierRank[profile.tier] ?? 0)) {
             await supabase.from('profiles').update({ tier: newTier, stripe_customer_id: customerId }).eq('id', userId);
           } else {
-            // Don't downgrade via upgrade webhook; only set the customer id.
             await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', userId);
           }
           break;
         }
 
-        // ---------- DOWNGRADE (cancel) ----------
         case 'customer.subscription.deleted': {
           const sub = event.data.object;
           const customerId = sub.customer;
@@ -109,20 +102,13 @@ app.post('/api/webhook/stripe',
           break;
         }
 
-        // ---------- DUNNING ----------
         case 'invoice.payment_failed': {
           const inv = event.data.object;
           const customerId = inv.customer;
-          // Soft-fail: mark via a sentinel in tone_rules-free way. For now,
-          // simply log so you can wire email/Slack alerts off this in prod.
           console.warn(`[billing] payment_failed for customer ${customerId}`);
-          // Optional: downgrade after N failed retries. Keeping it a log
-          // event for now so you don't accidentally lock paying users out
-          // on a single failed retry.
           break;
         }
 
-        // ---------- SUBSCRIPTION DOWNGRADE VIA PORTAL ----------
         case 'customer.subscription.updated': {
           const sub = event.data.object;
           if (sub.status === 'active' || sub.status === 'trialing') {
@@ -136,34 +122,24 @@ app.post('/api/webhook/stripe',
         }
 
         default:
-          // Unhandled events are fine; Stripe expects 2xx.
           break;
       }
     } catch (err) {
       console.error('Webhook handler error:', err);
-      // Still 200 so Stripe doesn't infinitely retry; alert via logs.
     }
 
     res.json({ received: true });
   }
 );
 
-// Use JSON for everything else
 app.use(express.json({ limit: '1mb' }));
 
-// ---------------------------------------------------------------------------
-// Supabase + Gemini clients
-// ---------------------------------------------------------------------------
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// ---------------------------------------------------------------------------
-// In-memory rate limiter (per-user, sliding window).
-// Good enough for launch; swap for Redis once you have multiple instances.
-// ---------------------------------------------------------------------------
 const RATE_BUCKETS = new Map();
 const RATE_LIMITS = {
-  autofill: { windowMs: 60_000, max: 20 },   // 20 / minute / user
+  autofill: { windowMs: 60_000, max: 20 },
   learn:    { windowMs: 60_000, max: 30 },
   support:  { windowMs: 60_000, max: 5 }
 };
@@ -179,15 +155,11 @@ function rateLimit(category, key) {
   return entry.count <= cfg.max;
 }
 
-// Garbage-collect stale buckets every 5 min so the map doesn't grow forever.
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of RATE_BUCKETS) if (v.resetAt < now) RATE_BUCKETS.delete(k);
 }, 5 * 60_000).unref?.();
 
-// ---------------------------------------------------------------------------
-// Auth helper — verifies the Supabase JWT and returns the user, or 401.
-// ---------------------------------------------------------------------------
 async function getUserFromToken(token) {
   if (!token || typeof token !== 'string') return null;
   const { data, error } = await supabase.auth.getUser(token);
@@ -195,18 +167,10 @@ async function getUserFromToken(token) {
   return data.user;
 }
 
-// ---------------------------------------------------------------------------
-// Basic prompt-injection guard for uploaded PDFs.
-// Strips obvious instruction-override patterns from text we feed to the LLM.
-// Not a perfect defense (nothing is), but raises the cost of attack and
-// keeps the LLM from following embedded "ignore previous instructions" lines.
-// ---------------------------------------------------------------------------
 function sanitizePdfText(raw) {
   if (!raw) return '';
   let text = String(raw);
-  // Remove very long control-character runs (PDF artifacts)
   text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]+/g, ' ');
-  // Defang common prompt-injection patterns
   const patterns = [
     /ignore (?:all )?previous instructions/gi,
     /disregard (?:the )?system prompt/gi,
@@ -215,14 +179,10 @@ function sanitizePdfText(raw) {
     /\bnew instructions:\b/gi
   ];
   for (const re of patterns) text = text.replace(re, '[REDACTED]');
-  // Cap total characters to keep prompts predictable (40k chars ≈ ~10k tokens).
   if (text.length > 40_000) text = text.slice(0, 40_000) + '\n[... truncated ...]';
   return text;
 }
 
-// ---------------------------------------------------------------------------
-// 1. AUTOFILL
-// ---------------------------------------------------------------------------
 app.post('/api/autofill', async (req, res) => {
   const { fields, token } = req.body || {};
   if (!token) return res.status(401).json({ error: "Unauthorized." });
@@ -255,7 +215,6 @@ app.post('/api/autofill', async (req, res) => {
       return res.status(404).json({ error: "No company docs found. Upload PDFs in the extension first." });
     }
 
-    // Build the knowledge base, capped at 3 PDFs (must match UI label).
     let companyKnowledgeBase = "";
     let parsedCount = 0;
     const MAX_PDFS = 3;
@@ -371,9 +330,6 @@ INSTRUCTIONS:
   }
 });
 
-// ---------------------------------------------------------------------------
-// 2. LEARN
-// ---------------------------------------------------------------------------
 app.post('/api/learn', async (req, res) => {
   const { qnaPairs, token } = req.body || {};
   const user = await getUserFromToken(token);
@@ -383,7 +339,6 @@ app.post('/api/learn', async (req, res) => {
   }
   if (!rateLimit('learn', user.id)) return res.status(429).json({ error: "Rate limit exceeded." });
 
-  // Defensive: cap size, strip empties, and clip long text.
   const cleaned = qnaPairs
     .filter(p => p && typeof p.question === 'string' && typeof p.answer === 'string')
     .map(p => ({
@@ -404,9 +359,6 @@ app.post('/api/learn', async (req, res) => {
   return res.json({ status: "SUCCESS", saved: cleaned.length });
 });
 
-// ---------------------------------------------------------------------------
-// 3. SUPPORT
-// ---------------------------------------------------------------------------
 app.post('/api/support', async (req, res) => {
   const { message, email, token } = req.body || {};
   const user = await getUserFromToken(token);
@@ -428,9 +380,6 @@ app.post('/api/support', async (req, res) => {
   return res.json({ status: "SUCCESS" });
 });
 
-// ---------------------------------------------------------------------------
-// 4. ANALYTICS (best-effort, no auth — these are low-stakes counters)
-// ---------------------------------------------------------------------------
 app.post('/api/analytics/install', (req, res) => {
   console.log('[analytics] install', JSON.stringify(req.body || {}));
   res.json({ status: "OK" });
@@ -440,12 +389,6 @@ app.post('/api/analytics/update', (req, res) => {
   res.json({ status: "OK" });
 });
 
-// ---------------------------------------------------------------------------
-// 5. HOSTED PASSWORD RESET PAGE
-// ---------------------------------------------------------------------------
-// ==========================================
-// 5. HOSTED PASSWORD RESET PAGE
-// ==========================================
 app.get('/reset-password', (req, res) => {
   res.set('Content-Type', 'text/html; charset=utf-8');
   res.send(`
@@ -497,60 +440,100 @@ app.get('/reset-password', (req, res) => {
   <script>
     const SUPABASE_URL = '${process.env.SUPABASE_URL || 'https://lushkpzfgsazrzkbsxbx.supabase.co'}';
     const SUPABASE_KEY = '${process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1c2hrcHpmZ3NhenJ6a2JzeGJ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgwNTQ0ODAsImV4cCI6MjEwMzYzMDQ4MH0.Z2A91Jkr0d0M1_DhV49AmU7H6vsNNaJFJWdlqoXPl5c'}';
-    
-    // FIX: Renamed 'supabase' to 'supabaseClient' to avoid conflicting with the CDN variable
+
     const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
       auth: {
         persistSession: false,
         detectSessionInUrl: false
       }
     });
-    
+
     const status = document.getElementById('status');
     const btn = document.getElementById('submit-btn');
-    
+
     function setStatus(text, kind) {
       status.textContent = text;
       status.className = kind || '';
     }
-    
+
     function withTimeout(promise, ms, label) {
       return Promise.race([
         promise,
         new Promise((_, reject) => setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms))
       ]);
     }
-    
+
+    // Supabase can hand the reset token back to us three different ways
+    // depending on the project's auth-flow setting:
+    //  1) Hash fragment (the default / implicit flow):
+    //     #access_token=...&refresh_token=...&type=recovery
+    //  2) PKCE query param: ?code=...
+    //  3) Newer OTP-style query params: ?token_hash=...&type=recovery
+    // The old version of this page only checked for (2), which is why a
+    // standard reset link always failed instantly with "No reset token found".
     async function bootstrap() {
       const url = new URL(window.location.href);
+      const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+
+      const hashError = hashParams.get('error_description');
+      const queryError = url.searchParams.get('error_description');
+      if (hashError || queryError) {
+        setStatus('Reset link error: ' + (hashError || queryError).replace(/\\+/g, ' '), 'error');
+        return;
+      }
+
+      const accessToken = hashParams.get('access_token');
+      const refreshToken = hashParams.get('refresh_token');
+      const hashType = hashParams.get('type');
+
       const code = url.searchParams.get('code');
-      const error_description = url.searchParams.get('error_description');
-      
-      if (error_description) {
-        setStatus('Reset link error: ' + error_description, 'error');
-        return;
-      }
-      if (!code) {
-        setStatus('No reset token found. Please request a new password reset email.', 'error');
-        return;
-      }
+      const tokenHash = url.searchParams.get('token_hash');
+      const queryType = url.searchParams.get('type');
+
       try {
-        // FIX: Using supabaseClient here
-        const { data, error } = await withTimeout(
-          supabaseClient.auth.exchangeCodeForSession(code),
-          10000,
-          'Code exchange'
-        );
-        if (error) throw error;
+        if (accessToken && refreshToken && (hashType === 'recovery' || !hashType)) {
+          // Case 1: implicit flow — establish the session directly from the
+          // tokens Supabase already gave us in the fragment.
+          const { error } = await withTimeout(
+            supabaseClient.auth.setSession({ access_token: accessToken, refresh_token: refreshToken }),
+            10000,
+            'Session setup'
+          );
+          if (error) throw error;
+        } else if (code) {
+          // Case 2: PKCE flow.
+          const { error } = await withTimeout(
+            supabaseClient.auth.exchangeCodeForSession(code),
+            10000,
+            'Code exchange'
+          );
+          if (error) throw error;
+        } else if (tokenHash && (queryType === 'recovery' || !queryType)) {
+          // Case 3: token_hash + verifyOtp flow.
+          const { error } = await withTimeout(
+            supabaseClient.auth.verifyOtp({ token_hash: tokenHash, type: 'recovery' }),
+            10000,
+            'Token verification'
+          );
+          if (error) throw error;
+        } else {
+          setStatus('No reset token found. Please request a new password reset email.', 'error');
+          return;
+        }
+
+        // Clear the sensitive token material from the address bar/history
+        // now that the session is established, without reloading the page.
+        window.history.replaceState({}, document.title, window.location.pathname);
+
         btn.disabled = false;
         btn.textContent = 'Update Password';
       } catch (err) {
         setStatus('Could not verify reset link: ' + err.message, 'error');
       }
     }
-    
+
     bootstrap();
-    
+
     document.getElementById('reset-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const newPassword = document.getElementById('new-password').value;
@@ -562,7 +545,6 @@ app.get('/reset-password', (req, res) => {
       btn.textContent = 'Updating...';
       setStatus('');
       try {
-        // FIX: Using supabaseClient here
         const { error } = await withTimeout(
           supabaseClient.auth.updateUser({ password: newPassword }),
           10000,
@@ -582,9 +564,7 @@ app.get('/reset-password', (req, res) => {
 </html>
   `);
 });
-// ---------------------------------------------------------------------------
-// Health
-// ---------------------------------------------------------------------------
+
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 const PORT = process.env.PORT || 3000;
