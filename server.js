@@ -5,9 +5,7 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI, Type } from '@google/genai';
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const pdfParse = require('pdf-parse');
+import { PDFParse } from 'pdf-parse';
 import Stripe from 'stripe';
 
 const app = express();
@@ -275,8 +273,8 @@ app.post('/api/autofill', async (req, res) => {
         if (!pdfBlob) continue;
         
         const buffer = Buffer.from(await pdfBlob.arrayBuffer());
-        const parseFn = typeof pdfParse === 'function' ? pdfParse : (pdfParse.default || pdfParse);
-const parsedPdf = await parseFn(buffer);
+        const parser = new PDFParse({ data: buffer });
+        const parsedPdf = await parser.getText();
         
         const clean = sanitizePdfText(parsedPdf.text);
         if (clean.trim()) {
