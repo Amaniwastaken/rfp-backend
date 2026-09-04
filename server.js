@@ -11,19 +11,9 @@ import Stripe from 'stripe';
 const app = express();
 
 // ---------------------------------------------------------------------------
-// CORS — restrict to your marketing site (and your own dev tools).
-// Chrome extensions don't send an Origin header in the MV3 model, so this
-// mainly blocks third-party web abuse. Adjust ALLOWED_ORIGINS to your real
-// domain before launch.
+// CORS & Security Headers
 // ---------------------------------------------------------------------------
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://rfp-auto-filler.com,http://localhost:3000')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-app.use(cors());
-// Lightweight security headers (no extra dep). Helmet would do more, but
-// for a JSON API + one inline-script HTML page, these are enough.
+app.use(cors()); // Left open intentionally for Chrome Extension traffic
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -33,107 +23,108 @@ app.use((_req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Stripe webhook MUST be mounted before express.json so we keep the raw body
-// for signature verification.
+// Stripe Webhook (Raw Body required)
 // ---------------------------------------------------------------------------
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Map Stripe price.id -> tier name. Set these in Railway env to match your
-// actual Stripe price IDs. The previous version mapped by amount_total which
-// breaks the moment you apply a coupon, change a price, or enable Stripe Tax.
 const PRICE_ID_TO_TIER = {
   [process.env.STRIPE_PRICE_STARTER || 'price_starter_xxx']: 'Starter',
   [process.env.STRIPE_PRICE_GROWTH  || 'price_growth_xxx']:  'Growth',
   [process.env.STRIPE_PRICE_AGENCY  || 'price_agency_xxx']:  'Agency'
 };
 
-app.post('/api/webhook/stripe',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-      console.error('Stripe signature failed:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-
-    try {
-      switch (event.type) {
-
-        // ---------- UPGRADE ----------
-        case 'checkout.session.completed': {
-          const session = event.data.object;
-          if (session.payment_status !== 'paid') break;
-          const userId = session.client_reference_id;
-          const customerId = session.customer;
-          if (!userId) break;
-
-          let newTier = null;
-          try {
-            const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
-            const priceId = lineItems.data[0]?.price?.id;
-            if (priceId && PRICE_ID_TO_TIER[priceId]) newTier = PRICE_ID_TO_TIER[priceId];
-          } catch (_) { /* fall through */ }
-          if (!newTier) {
-            if (session.amount_total === 1900) newTier = 'Starter';
-            else if (session.amount_total === 4900) newTier = 'Growth';
-            else if (session.amount_total === 9900) newTier = 'Agency';
-          }
-          if (!newTier) newTier = 'Starter';
-
-          const { data: profile } = await supabase.from('profiles').select('tier').eq('id', userId).single();
-          const tierRank = { Free: 0, Starter: 1, Growth: 2, Agency: 3 };
-          if (!profile || (tierRank[newTier] ?? 0) >= (tierRank[profile.tier] ?? 0)) {
-            await supabase.from('profiles').update({ tier: newTier, stripe_customer_id: customerId }).eq('id', userId);
-          } else {
-            await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', userId);
-          }
-          break;
-        }
-
-        case 'customer.subscription.deleted': {
-          const sub = event.data.object;
-          const customerId = sub.customer;
-          await supabase.from('profiles').update({ tier: 'Free' }).eq('stripe_customer_id', customerId);
-          break;
-        }
-
-        case 'invoice.payment_failed': {
-          const inv = event.data.object;
-          const customerId = inv.customer;
-          console.warn(`[billing] payment_failed for customer ${customerId}`);
-          break;
-        }
-
-        case 'customer.subscription.updated': {
-          const sub = event.data.object;
-          if (sub.status === 'active' || sub.status === 'trialing') {
-            const priceId = sub.items?.data?.[0]?.price?.id;
-            const newTier = PRICE_ID_TO_TIER[priceId];
-            if (newTier) {
-              await supabase.from('profiles').update({ tier: newTier }).eq('stripe_customer_id', sub.customer);
-            }
-          }
-          break;
-        }
-
-        default:
-          break;
-      }
-    } catch (err) {
-      console.error('Webhook handler error:', err);
-    }
-
-    res.json({ received: true });
+app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Stripe signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-);
+
+  const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+  // 1. Stripe Idempotency Check
+  const { data: existingEvent } = await supabase.from('stripe_events').select('id').eq('id', event.id).single();
+  if (existingEvent) {
+    return res.json({ received: true, skipped: true }); // Already processed
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        if (session.payment_status !== 'paid') break;
+        const userId = session.client_reference_id;
+        const customerId = session.customer;
+        if (!userId) break;
+
+        let newTier = null;
+        try {
+          const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
+          const priceId = lineItems.data[0]?.price?.id;
+          if (priceId && PRICE_ID_TO_TIER[priceId]) newTier = PRICE_ID_TO_TIER[priceId];
+        } catch (_) { /* fall through */ }
+        
+        if (!newTier) {
+          if (session.amount_total === 1900) newTier = 'Starter';
+          else if (session.amount_total === 4900) newTier = 'Growth';
+          else if (session.amount_total === 9900) newTier = 'Agency';
+        }
+        if (!newTier) newTier = 'Starter';
+
+        const { data: profile } = await supabase.from('profiles').select('tier').eq('id', userId).single();
+        const tierRank = { Free: 0, Starter: 1, Growth: 2, Agency: 3 };
+        
+        if (!profile || (tierRank[newTier] ?? 0) >= (tierRank[profile.tier] ?? 0)) {
+          await supabase.from('profiles').update({ tier: newTier, stripe_customer_id: customerId }).eq('id', userId);
+        } else {
+          await supabase.from('profiles').update({ stripe_customer_id: customerId }).eq('id', userId);
+        }
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        await supabase.from('profiles').update({ tier: 'Free' }).eq('stripe_customer_id', sub.customer);
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const inv = event.data.object;
+        console.warn(`[billing] payment_failed for customer ${inv.customer}`);
+        break;
+      }
+
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        if (sub.status === 'active' || sub.status === 'trialing') {
+          const priceId = sub.items?.data?.[0]?.price?.id;
+          const newTier = PRICE_ID_TO_TIER[priceId];
+          if (newTier) {
+            await supabase.from('profiles').update({ tier: newTier }).eq('stripe_customer_id', sub.customer);
+          }
+        }
+        break;
+      }
+    }
+
+    // 2. Log event in idempotency table
+    await supabase.from('stripe_events').insert([{ id: event.id, type: event.type }]);
+
+  } catch (err) {
+    console.error('Webhook handler error:', err);
+  }
+
+  res.json({ received: true });
+});
 
 app.use(express.json({ limit: '1mb' }));
 
+// ---------------------------------------------------------------------------
+// Supabase, Gemini, & Limiters
+// ---------------------------------------------------------------------------
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -143,6 +134,7 @@ const RATE_LIMITS = {
   learn:    { windowMs: 60_000, max: 30 },
   support:  { windowMs: 60_000, max: 5 }
 };
+
 function rateLimit(category, key) {
   const cfg = RATE_LIMITS[category];
   if (!cfg) return true;
@@ -167,6 +159,7 @@ async function getUserFromToken(token) {
   return data.user;
 }
 
+// Security sanitizer (used for BOTH PDFs and Form Field Labels now)
 function sanitizePdfText(raw) {
   if (!raw) return '';
   let text = String(raw);
@@ -183,6 +176,9 @@ function sanitizePdfText(raw) {
   return text;
 }
 
+// ---------------------------------------------------------------------------
+// Auto-fill Route
+// ---------------------------------------------------------------------------
 app.post('/api/autofill', async (req, res) => {
   const { fields, token } = req.body || {};
   if (!token) return res.status(401).json({ error: "Unauthorized." });
@@ -232,9 +228,7 @@ app.post('/api/autofill', async (req, res) => {
           companyKnowledgeBase += `\n--- Document: ${file.name} ---\n${clean}\n`;
           parsedCount++;
         }
-      } catch (e) {
-        console.error(`[pdf] parse failed for ${file.name}:`, e.message);
-      }
+      } catch (e) { console.error(`[pdf] parse failed for ${file.name}:`, e.message); }
     }
 
     if (!companyKnowledgeBase.trim()) {
@@ -251,6 +245,12 @@ app.post('/api/autofill', async (req, res) => {
     } else {
       memoryContext += "(none)\n";
     }
+
+    // SANITIZE EXTERNAL FORM FIELDS
+    const sanitizedFields = Array.isArray(fields) ? fields.map(f => ({
+      field_index: f.field_index,
+      label: sanitizePdfText(f.label || 'Unknown Field')
+    })) : [];
 
     const responseSchema = {
       type: Type.ARRAY,
@@ -277,7 +277,7 @@ ${companyKnowledgeBase}
 ${memoryContext}
 
 FORM QUESTIONS:
-${JSON.stringify(fields)}
+${JSON.stringify(sanitizedFields)}
 
 INSTRUCTIONS:
 1. Check "PREVIOUSLY SAVED MANUAL ANSWERS" first — if one matches, use it verbatim.
@@ -294,7 +294,7 @@ INSTRUCTIONS:
     let aiResponse;
     try {
       aiResponse = await ai.models.generateContent({
-        model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+        model: process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
         contents: prompt,
         config: { responseMimeType: 'application/json', responseSchema, temperature: 0.1 }
       });
@@ -334,9 +334,7 @@ app.post('/api/learn', async (req, res) => {
   const { qnaPairs, token } = req.body || {};
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  if (!Array.isArray(qnaPairs) || qnaPairs.length === 0) {
-    return res.status(400).json({ error: "No Q/A pairs provided." });
-  }
+  if (!Array.isArray(qnaPairs) || qnaPairs.length === 0) return res.status(400).json({ error: "No Q/A pairs provided." });
   if (!rateLimit('learn', user.id)) return res.status(429).json({ error: "Rate limit exceeded." });
 
   const cleaned = qnaPairs
@@ -352,10 +350,7 @@ app.post('/api/learn', async (req, res) => {
   if (cleaned.length === 0) return res.status(400).json({ error: "No valid Q/A pairs." });
 
   const { error } = await supabase.from('custom_answers').upsert(cleaned, { onConflict: 'user_id,question' });
-  if (error) {
-    console.error('[learn] upsert failed:', error.message);
-    return res.status(500).json({ error: "Failed to save answers." });
-  }
+  if (error) return res.status(500).json({ error: "Failed to save answers." });
   return res.json({ status: "SUCCESS", saved: cleaned.length });
 });
 
@@ -363,9 +358,7 @@ app.post('/api/support', async (req, res) => {
   const { message, email, token } = req.body || {};
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  if (!message || typeof message !== 'string' || !message.trim()) {
-    return res.status(400).json({ error: "Message is required." });
-  }
+  if (!message || typeof message !== 'string' || !message.trim()) return res.status(400).json({ error: "Message required." });
   if (!rateLimit('support', user.id)) return res.status(429).json({ error: "Rate limit exceeded." });
 
   const { error } = await supabase.from('support_inquiries').insert([{
@@ -373,21 +366,13 @@ app.post('/api/support', async (req, res) => {
     email: (email || '').slice(0, 254) || null,
     message: message.trim().slice(0, 4000)
   }]);
-  if (error) {
-    console.error('[support] insert failed:', error.message);
-    return res.status(500).json({ error: "Failed to send message." });
-  }
+  
+  if (error) return res.status(500).json({ error: "Failed to send message." });
   return res.json({ status: "SUCCESS" });
 });
 
-app.post('/api/analytics/install', (req, res) => {
-  console.log('[analytics] install', JSON.stringify(req.body || {}));
-  res.json({ status: "OK" });
-});
-app.post('/api/analytics/update', (req, res) => {
-  console.log('[analytics] update', JSON.stringify(req.body || {}));
-  res.json({ status: "OK" });
-});
+app.post('/api/analytics/install', (req, res) => res.json({ status: "OK" }));
+app.post('/api/analytics/update', (req, res) => res.json({ status: "OK" }));
 
 app.get('/reset-password', (req, res) => {
   res.set('Content-Type', 'text/html; charset=utf-8');
@@ -442,10 +427,7 @@ app.get('/reset-password', (req, res) => {
     const SUPABASE_KEY = '${process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1c2hrcHpmZ3NhenJ6a2JzeGJ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgwNTQ0ODAsImV4cCI6MjEwMzYzMDQ4MH0.Z2A91Jkr0d0M1_DhV49AmU7H6vsNNaJFJWdlqoXPl5c'}';
 
     const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
-      auth: {
-        persistSession: false,
-        detectSessionInUrl: false
-      }
+      auth: { persistSession: false, detectSessionInUrl: false }
     });
 
     const status = document.getElementById('status');
@@ -463,14 +445,6 @@ app.get('/reset-password', (req, res) => {
       ]);
     }
 
-    // Supabase can hand the reset token back to us three different ways
-    // depending on the project's auth-flow setting:
-    //  1) Hash fragment (the default / implicit flow):
-    //     #access_token=...&refresh_token=...&type=recovery
-    //  2) PKCE query param: ?code=...
-    //  3) Newer OTP-style query params: ?token_hash=...&type=recovery
-    // The old version of this page only checked for (2), which is why a
-    // standard reset link always failed instantly with "No reset token found".
     async function bootstrap() {
       const url = new URL(window.location.href);
       const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
@@ -485,46 +459,25 @@ app.get('/reset-password', (req, res) => {
       const accessToken = hashParams.get('access_token');
       const refreshToken = hashParams.get('refresh_token');
       const hashType = hashParams.get('type');
-
       const code = url.searchParams.get('code');
       const tokenHash = url.searchParams.get('token_hash');
       const queryType = url.searchParams.get('type');
 
       try {
         if (accessToken && refreshToken && (hashType === 'recovery' || !hashType)) {
-          // Case 1: implicit flow — establish the session directly from the
-          // tokens Supabase already gave us in the fragment.
-          const { error } = await withTimeout(
-            supabaseClient.auth.setSession({ access_token: accessToken, refresh_token: refreshToken }),
-            10000,
-            'Session setup'
-          );
+          const { error } = await withTimeout(supabaseClient.auth.setSession({ access_token: accessToken, refresh_token: refreshToken }), 10000, 'Session setup');
           if (error) throw error;
         } else if (code) {
-          // Case 2: PKCE flow.
-          const { error } = await withTimeout(
-            supabaseClient.auth.exchangeCodeForSession(code),
-            10000,
-            'Code exchange'
-          );
+          const { error } = await withTimeout(supabaseClient.auth.exchangeCodeForSession(code), 10000, 'Code exchange');
           if (error) throw error;
         } else if (tokenHash && (queryType === 'recovery' || !queryType)) {
-          // Case 3: token_hash + verifyOtp flow.
-          const { error } = await withTimeout(
-            supabaseClient.auth.verifyOtp({ token_hash: tokenHash, type: 'recovery' }),
-            10000,
-            'Token verification'
-          );
+          const { error } = await withTimeout(supabaseClient.auth.verifyOtp({ token_hash: tokenHash, type: 'recovery' }), 10000, 'Token verification');
           if (error) throw error;
         } else {
           setStatus('No reset token found. Please request a new password reset email.', 'error');
           return;
         }
-
-        // Clear the sensitive token material from the address bar/history
-        // now that the session is established, without reloading the page.
         window.history.replaceState({}, document.title, window.location.pathname);
-
         btn.disabled = false;
         btn.textContent = 'Update Password';
       } catch (err) {
@@ -545,11 +498,7 @@ app.get('/reset-password', (req, res) => {
       btn.textContent = 'Updating...';
       setStatus('');
       try {
-        const { error } = await withTimeout(
-          supabaseClient.auth.updateUser({ password: newPassword }),
-          10000,
-          'Password update'
-        );
+        const { error } = await withTimeout(supabaseClient.auth.updateUser({ password: newPassword }), 10000, 'Password update');
         if (error) throw error;
         document.getElementById('form-screen').style.display = 'none';
         document.getElementById('success-screen').style.display = 'block';
@@ -566,6 +515,5 @@ app.get('/reset-password', (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
