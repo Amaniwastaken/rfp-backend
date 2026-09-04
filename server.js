@@ -443,6 +443,9 @@ app.post('/api/analytics/update', (req, res) => {
 // ---------------------------------------------------------------------------
 // 5. HOSTED PASSWORD RESET PAGE
 // ---------------------------------------------------------------------------
+// ==========================================
+// 5. HOSTED PASSWORD RESET PAGE
+// ==========================================
 app.get('/reset-password', (req, res) => {
   res.set('Content-Type', 'text/html; charset=utf-8');
   res.send(`
@@ -494,29 +497,35 @@ app.get('/reset-password', (req, res) => {
   <script>
     const SUPABASE_URL = '${process.env.SUPABASE_URL || 'https://lushkpzfgsazrzkbsxbx.supabase.co'}';
     const SUPABASE_KEY = '${process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1c2hrcHpmZ3NhenJ6a2JzeGJ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgwNTQ0ODAsImV4cCI6MjEwMzYzMDQ4MH0.Z2A91Jkr0d0M1_DhV49AmU7H6vsNNaJFJWdlqoXPl5c'}';
-    const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+    
+    // FIX: Renamed 'supabase' to 'supabaseClient' to avoid conflicting with the CDN variable
+    const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
       auth: {
         persistSession: false,
         detectSessionInUrl: false
       }
     });
+    
     const status = document.getElementById('status');
     const btn = document.getElementById('submit-btn');
+    
     function setStatus(text, kind) {
       status.textContent = text;
       status.className = kind || '';
     }
+    
     function withTimeout(promise, ms, label) {
       return Promise.race([
         promise,
         new Promise((_, reject) => setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms))
       ]);
     }
+    
     async function bootstrap() {
       const url = new URL(window.location.href);
       const code = url.searchParams.get('code');
       const error_description = url.searchParams.get('error_description');
-      console.log('[reset] URL params:', JSON.stringify(Object.fromEntries(url.searchParams)));
+      
       if (error_description) {
         setStatus('Reset link error: ' + error_description, 'error');
         return;
@@ -526,21 +535,22 @@ app.get('/reset-password', (req, res) => {
         return;
       }
       try {
+        // FIX: Using supabaseClient here
         const { data, error } = await withTimeout(
-          supabase.auth.exchangeCodeForSession(code),
+          supabaseClient.auth.exchangeCodeForSession(code),
           10000,
           'Code exchange'
         );
         if (error) throw error;
-        console.log('[reset] session established for user:', data?.session?.user?.id);
         btn.disabled = false;
         btn.textContent = 'Update Password';
       } catch (err) {
-        console.error('[reset] code exchange failed:', err);
         setStatus('Could not verify reset link: ' + err.message, 'error');
       }
     }
+    
     bootstrap();
+    
     document.getElementById('reset-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const newPassword = document.getElementById('new-password').value;
@@ -552,8 +562,9 @@ app.get('/reset-password', (req, res) => {
       btn.textContent = 'Updating...';
       setStatus('');
       try {
+        // FIX: Using supabaseClient here
         const { error } = await withTimeout(
-          supabase.auth.updateUser({ password: newPassword }),
+          supabaseClient.auth.updateUser({ password: newPassword }),
           10000,
           'Password update'
         );
@@ -561,7 +572,6 @@ app.get('/reset-password', (req, res) => {
         document.getElementById('form-screen').style.display = 'none';
         document.getElementById('success-screen').style.display = 'block';
       } catch (err) {
-        console.error('[reset] updateUser error:', err);
         setStatus('Error updating password: ' + err.message, 'error');
         btn.disabled = false;
         btn.textContent = 'Update Password';
@@ -572,7 +582,6 @@ app.get('/reset-password', (req, res) => {
 </html>
   `);
 });
-
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
