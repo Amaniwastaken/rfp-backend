@@ -275,7 +275,8 @@ app.post('/api/autofill', async (req, res) => {
         if (!pdfBlob) continue;
         
         const buffer = Buffer.from(await pdfBlob.arrayBuffer());
-        const parsedPdf = await pdfParse(buffer);
+        const parseFn = typeof pdfParse === 'function' ? pdfParse : (pdfParse.default || pdfParse);
+const parsedPdf = await parseFn(buffer);
         
         const clean = sanitizePdfText(parsedPdf.text);
         if (clean.trim()) {
